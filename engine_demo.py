@@ -359,12 +359,195 @@ def demo_normalization_system(output_dir="renders"):
     normalization_data_path = os.path.join(output_dir, "normalization_data.pkl")
     engine.export_normalization_data(normalization_data_path)
     
+    # Создаем финальную композитную картинку
+    print("\n🎨 Создание финальной композитной картинки...")
+    create_final_composite_image(engine, demo_scene_sdf, camera_pos, camera_target, output_dir)
+    
     print("\n📊 Информация о нормализации:")
     norm_info = engine.get_info().get('normalization', {})
     print(f"   Кадров накоплено: {norm_info.get('frames_accumulated', 0)}")
     print(f"   Всего кадров: {norm_info.get('total_frames', 0)}")
     print(f"   Готовность: {'Да' if norm_info.get('is_ready', False) else 'Нет'}")
     print(f"   Сила применения: {norm_info.get('strength', 0.0):.1f}")
+
+
+def create_final_composite_image(engine, scene_sdf, camera_pos, camera_target, output_dir):
+    """Создание финальной композитной картинки с градиентом нормализации"""
+    
+    # Сохраняем исходную силу нормализации
+    original_strength = engine.config.normalization_strength
+    
+    # Создаем несколько изображений с разной силой нормализации
+    strengths = [0.0, 0.25, 0.5, 0.75, 1.0]
+    images = []
+    
+    print("   Рендеринг градиента нормализации...")
+    for i, strength in enumerate(strengths):
+        print(f"     Сила {strength:.2f} ({i+1}/{len(strengths)})")
+        engine.set_normalization_strength(strength)
+        img, info = engine.render(scene_sdf, camera_pos, camera_target)
+        
+        # Конвертируем в правильный формат
+        if len(img.shape) == 3 and img.dtype == np.uint8:
+            img_normalized = img.astype(np.float32) / 255.0
+        else:
+            img_normalized = img
+            
+        images.append(img_normalized)
+    
+    # Восстанавливаем исходную силу
+    engine.set_normalization_strength(original_strength)
+    
+    # Получаем карты интерференции
+    interference_combined = engine.get_interference_pattern('combined')
+    interference_red = engine.get_interference_pattern('red')
+    interference_green = engine.get_interference_pattern('green')
+    interference_blue = engine.get_interference_pattern('blue')
+    
+    # Создаем композитную картинку
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        
+        # Размеры для композита
+        img_height, img_width = images[0].shape[:2]
+        
+        # Создаем большую композитную картинку
+        composite_width = img_width * 5  # 5 изображений по горизонтали
+        composite_height = img_height * 3  # 3 ряда
+        
+        composite = np.ones((composite_height, composite_width, 3), dtype=np.float32)
+        
+        # Первый ряд: градиент нормализации
+        for i, img in enumerate(images):
+            x_start = i * img_width
+            x_end = x_start + img_width
+            
+            if len(img.shape) == 3:
+                composite[0:img_height, x_start:x_end, :] = img
+            else:
+                # Монохромное изображение - дублируем на все каналы
+                composite[0:img_height, x_start:x_end, :] = np.stack([img] * 3, axis=2)
+        
+        # Второй ряд: карты интерференции
+        interference_maps = [interference_red, interference_green, interference_blue, interference_combined]
+        interference_names = ['Red', 'Green', 'Blue', 'Combined']
+        
+        for i, (interference_map, name) in enumerate(zip(interference_maps, interference_names)):
+            if interference_map is not None:
+                x_start = i * img_width
+                x_end = x_start + img_width
+                y_start = img_height
+                y_end = y_start + img_height
+                
+                # Нормализуем карту интерференции
+                map_normalized = (interference_map - interference_map.min()) / (interference_map.max() - interference_map.min() + 1e-8)
+                
+                # Применяем цветовую карту для визуализации
+                if i < 3:  # RGB каналы
+                    colored_map = np.zeros((img_height, img_width, 3))
+                    colored_map[:, :, i] = map_normalized  # Отображаем в соответствующий цветовой канал
+                else:  # Combined
+                    colored_map = plt.cm.viridis(map_normalized)[:, :, :3]  # Используем цветовую карту viridis
+                
+                composite[y_start:y_end, x_start:x_end, :] = colored_map
+        
+        # Третий ряд: сравнение до/после и анализ
+        # Изображение без нормализации
+        img_before = images[0]  # strength 0.0
+        img_after = images[-1]  # strength 1.0
+        
+        # Разностное изображение
+        diff_img = np.abs(img_after - img_before)
+        diff_img = diff_img / (diff_img.max() + 1e-8)  # Нормализуем
+        
+        # Градиентная карта силы
+        gradient_map = np.zeros((img_height, img_width, 3))
+        for i in range(img_width):
+            strength_val = i / img_width
+            gradient_map[:, i, :] = plt.cm.plasma(strength_val)[:3]  # Градиент от 0 до 1
+        
+        # Заполняем третий ряд
+        y_start = img_height * 2
+        y_end = y_start + img_height
+        
+        # До нормализации
+        if len(img_before.shape) == 3:
+            composite[y_start:y_end, 0:img_width, :] = img_before
+        else:
+            composite[y_start:y_end, 0:img_width, :] = np.stack([img_before] * 3, axis=2)
+        
+        # После нормализации
+        if len(img_after.shape) == 3:
+            composite[y_start:y_end, img_width:img_width*2, :] = img_after
+        else:
+            composite[y_start:y_end, img_width:img_width*2, :] = np.stack([img_after] * 3, axis=2)
+        
+        # Разность
+        composite[y_start:y_end, img_width*2:img_width*3, :] = diff_img
+        
+        # Градиентная карта
+        composite[y_start:y_end, img_width*3:img_width*4, :] = gradient_map
+        
+        # Оставляем последний участок для текста или пустым
+        
+        # Конвертируем в uint8 и создаем PIL изображение
+        composite_uint8 = (np.clip(composite, 0, 1) * 255).astype(np.uint8)
+        composite_img = Image.fromarray(composite_uint8)
+        
+        # Добавляем текстовые метки
+        draw = ImageDraw.Draw(composite_img)
+        
+        # Пытаемся загрузить шрифт, если не получается - используем стандартный
+        try:
+            font_large = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 40)
+            font_small = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 30)
+        except:
+            try:
+                font_large = ImageFont.load_default()
+                font_small = ImageFont.load_default()
+            except:
+                font_large = None
+                font_small = None
+        
+        # Заголовки рядов
+        draw.text((10, 10), "Градиент нормализации (сила: 0.0 → 1.0)", fill=(255, 255, 255), font=font_large)
+        draw.text((10, img_height + 10), "Карты интерференции по каналам", fill=(255, 255, 255), font=font_large)
+        draw.text((10, img_height * 2 + 10), "Анализ: До → После → Разность → Градиент", fill=(255, 255, 255), font=font_large)
+        
+        # Подписи для первого ряда
+        for i, strength in enumerate(strengths):
+            x_pos = i * img_width + img_width // 2 - 30
+            draw.text((x_pos, img_height - 40), f"{strength:.2f}", fill=(255, 255, 0), font=font_small)
+        
+        # Подписи для второго ряда
+        for i, name in enumerate(interference_names):
+            x_pos = i * img_width + img_width // 2 - len(name) * 8
+            draw.text((x_pos, img_height * 2 - 40), name, fill=(255, 255, 0), font=font_small)
+        
+        # Подписи для третьего ряда
+        labels = ["До", "После", "Разность", "Градиент"]
+        for i, label in enumerate(labels):
+            x_pos = i * img_width + img_width // 2 - len(label) * 8
+            draw.text((x_pos, composite_height - 40), label, fill=(255, 255, 0), font=font_small)
+        
+        # Сохраняем финальную композитную картинку
+        final_path = os.path.join(output_dir, "FINAL_NORMALIZATION_COMPOSITE.png")
+        composite_img.save(final_path, quality=95)
+        
+        print(f"✅ Финальная композитная картинка сохранена: {final_path}")
+        print(f"   Размер: {composite_width}x{composite_height}")
+        print(f"   Содержимое:")
+        print(f"     Ряд 1: Градиент нормализации (5 изображений)")
+        print(f"     Ряд 2: Карты интерференции (R, G, B, Combined)")
+        print(f"     Ряд 3: Анализ (До/После/Разность/Градиент)")
+        
+    except ImportError as e:
+        print(f"⚠️  Не удалось создать композитную картинку: {e}")
+        print("   Установите matplotlib: pip install matplotlib")
+    except Exception as e:
+        print(f"❌ Ошибка создания композитной картинки: {e}")
 
 
 def show_menu():
