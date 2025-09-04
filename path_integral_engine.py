@@ -76,6 +76,11 @@ class PathIntegralConfig:
         self.rendering_mode: RenderingMode = RenderingMode.RGB_SPECTRAL
         self.backend: RenderingBackend = RenderingBackend.GPU_MPS
         
+        # Система нормализации частот фотонов
+        self.enable_normalization: bool = False
+        self.normalization_frames: int = 100
+        self.normalization_strength: float = 1.0  # Сила применения нормализации (0.0-1.0)
+        
     @classmethod
     def from_preset(cls, preset: QualityPreset) -> 'PathIntegralConfig':
         """Создание конфигурации из предустановки"""
@@ -110,6 +115,155 @@ class PathIntegralConfig:
         return config
 
 
+class PhotonFrequencyMap:
+    """Система нормализации частот колебаний фотонов с интерференцией"""
+    
+    def __init__(self, width: int, height: int, normalization_frames: int = 100, device=None):
+        self.width = width
+        self.height = height
+        self.normalization_frames = normalization_frames
+        self.device = device or torch.device('cpu')
+        
+        # Карты накопления данных
+        self.amplitude_map = torch.zeros((height, width), dtype=torch.float32, device=self.device)
+        self.frequency_map = torch.zeros((height, width), dtype=torch.float32, device=self.device)
+        self.phase_map = torch.zeros((height, width), dtype=torch.float32, device=self.device)
+        self.frame_count = 0
+        
+        # Карты интерференции для RGB каналов
+        self.rgb_interference_maps = {
+            'red': torch.zeros((height, width), dtype=torch.complex64, device=self.device),
+            'green': torch.zeros((height, width), dtype=torch.complex64, device=self.device),
+            'blue': torch.zeros((height, width), dtype=torch.complex64, device=self.device)
+        }
+        
+        # Нормализованная карта интенсивности
+        self.normalized_intensity = torch.zeros((height, width, 3), dtype=torch.float32, device=self.device)
+        self.is_normalized = False
+        
+    def accumulate_frame(self, raw_amplitudes: Dict[str, torch.Tensor], wavelengths: Dict[str, float]):
+        """Накопление данных амплитуд и фаз за один кадр"""
+        if self.frame_count >= self.normalization_frames:
+            return
+            
+        # Накапливаем комплексные амплитуды для каждого канала
+        for channel, amplitude in raw_amplitudes.items():
+            if channel in self.rgb_interference_maps:
+                wavelength = wavelengths[channel]
+                
+                # Вычисляем частоту: f = c / λ
+                c = 3e8  # скорость света м/с
+                frequency = c / (wavelength * 1e-6)  # частота в Гц
+                
+                # Создаем комплексную амплитуду с фазой
+                phase = 2 * math.pi * frequency * self.frame_count / 60.0  # Предполагаем 60 FPS
+                
+                # Если amplitude уже комплексная, берем модуль для действительной части
+                if torch.is_complex(amplitude):
+                    amplitude_real = torch.abs(amplitude)
+                else:
+                    amplitude_real = amplitude
+                
+                # Создаем комплексные компоненты на том же устройстве
+                phase_tensor = torch.tensor(phase, device=amplitude.device, dtype=torch.float32)
+                real_part = amplitude_real * torch.cos(phase_tensor)
+                imag_part = amplitude_real * torch.sin(phase_tensor)
+                complex_amplitude = torch.complex(real_part, imag_part)
+                
+                # Переносим на устройство карты интерференции
+                complex_amplitude = complex_amplitude.to(self.rgb_interference_maps[channel].device)
+                
+                # Накапливаем в карте интерференции
+                self.rgb_interference_maps[channel] += complex_amplitude
+                
+        self.frame_count += 1
+        
+        # Если достигли 100 кадров, вычисляем нормализацию
+        if self.frame_count == self.normalization_frames:
+            self._compute_normalization()
+    
+    def _compute_normalization(self):
+        """Вычисление нормализованной карты с учетом интерференции"""
+        print(f"🔬 Вычисление карты интерференции для {self.normalization_frames} кадров...")
+        
+        # Для каждого канала вычисляем интерференционную картину
+        for i, (channel, complex_map) in enumerate(self.rgb_interference_maps.items()):
+            # Интенсивность = |амплитуда|²
+            intensity = torch.abs(complex_map) ** 2
+            
+            # Нормализуем интенсивность
+            max_intensity = torch.max(intensity)
+            if max_intensity > 0:
+                intensity = intensity / max_intensity
+            
+            self.normalized_intensity[:, :, i] = intensity
+        
+        # Вычисляем глобальную карту частот (средняя по всем каналам)
+        total_amplitude = torch.abs(
+            self.rgb_interference_maps['red'] + 
+            self.rgb_interference_maps['green'] + 
+            self.rgb_interference_maps['blue']
+        )
+        
+        # Нормализуем общую амплитуду
+        max_amp = torch.max(total_amplitude)
+        if max_amp > 0:
+            self.amplitude_map = total_amplitude / max_amp
+        
+        self.is_normalized = True
+        print("✅ Карта интерференции готова!")
+    
+    def apply_normalization(self, raw_image: torch.Tensor) -> torch.Tensor:
+        """Применение нормализации к изображению"""
+        if not self.is_normalized:
+            # Если нормализация ещё не готова, возвращаем исходное изображение
+            return raw_image
+        
+        # Переносим normalized_intensity на устройство изображения
+        normalized_intensity = self.normalized_intensity.to(raw_image.device)
+        
+        # Применяем интерференционную коррекцию
+        if len(raw_image.shape) == 3:  # RGB изображение
+            corrected_image = raw_image * normalized_intensity
+        else:  # Монохромное изображение
+            avg_intensity = torch.mean(normalized_intensity, dim=2)
+            corrected_image = raw_image * avg_intensity
+        
+        return corrected_image
+    
+    def get_interference_pattern(self, channel: str = 'combined') -> torch.Tensor:
+        """Получение интерференционной картины для визуализации"""
+        if not self.is_normalized:
+            return torch.zeros((self.height, self.width))
+        
+        if channel == 'combined':
+            # Комбинированная интерференция
+            combined = (
+                torch.abs(self.rgb_interference_maps['red']) +
+                torch.abs(self.rgb_interference_maps['green']) +
+                torch.abs(self.rgb_interference_maps['blue'])
+            ) / 3.0
+            return combined
+        elif channel in self.rgb_interference_maps:
+            return torch.abs(self.rgb_interference_maps[channel])
+        else:
+            return torch.zeros((self.height, self.width))
+    
+    def reset(self):
+        """Сброс накопленных данных для новой нормализации"""
+        self.amplitude_map = torch.zeros_like(self.amplitude_map)
+        self.frequency_map = torch.zeros_like(self.frequency_map) 
+        self.phase_map = torch.zeros_like(self.phase_map)
+        self.frame_count = 0
+        
+        for channel in self.rgb_interference_maps:
+            self.rgb_interference_maps[channel] = torch.zeros_like(self.rgb_interference_maps[channel])
+        
+        self.normalized_intensity = torch.zeros_like(self.normalized_intensity)
+        self.is_normalized = False
+        print("🔄 Карта интерференции сброшена")
+
+
 class RenderingBackendInterface(ABC):
     """Абстрактный интерфейс для backend'ов рендеринга"""
     
@@ -123,8 +277,14 @@ class RenderingBackendInterface(ABC):
         pass
         
     @abstractmethod
-    def render_frame(self, scene_sdf, camera_data) -> Tuple[np.ndarray, float]:
-        """Рендеринг одного кадра"""
+    def render_frame(self, scene_sdf, camera_data) -> Tuple[np.ndarray, float, Optional[Dict[str, torch.Tensor]]]:
+        """Рендеринг одного кадра
+        
+        Возвращает:
+        - img_array: изображение
+        - fps: кадры в секунду  
+        - raw_amplitudes: словарь сырых амплитуд по каналам (для нормализации)
+        """
         pass
         
     @abstractmethod
@@ -147,53 +307,64 @@ class GPUMPSBackend(RenderingBackendInterface):
         else:
             return torch.device("cpu")
             
-    def render_frame(self, scene_sdf, camera_data) -> Tuple[np.ndarray, float]:
+    def render_frame(self, scene_sdf, camera_data) -> Tuple[np.ndarray, float, Optional[Dict[str, torch.Tensor]]]:
         """Основной метод рендеринга для MPS"""
         start_time = time.time()
         
+        raw_amplitudes = None
+        
         if self.config.rendering_mode == RenderingMode.RGB_SPECTRAL:
-            img_array = self._render_spectral(scene_sdf, camera_data)
+            img_array, raw_amplitudes = self._render_spectral(scene_sdf, camera_data)
         else:
-            img_array = self._render_monochrome(scene_sdf, camera_data)
+            img_array, raw_amplitudes = self._render_monochrome(scene_sdf, camera_data)
             
         render_time = time.time() - start_time
         fps = 1.0 / render_time if render_time > 0 else 0
         
-        return img_array, fps
+        return img_array, fps, raw_amplitudes
         
     def _render_spectral(self, scene_sdf, camera_data):
         """Спектральный RGB рендеринг"""
         # Создаем RGB буферы
         rgb_buffer = torch.zeros(self.config.height, self.config.width, 3, device=self.device)
+        raw_amplitudes = {}
         
         # Рендерим каждый канал отдельно
         for i, (color, wavelength) in enumerate(self.config.wavelengths.items()):
             if color in ['red', 'green', 'blue']:
                 k = 2.0 * math.pi / wavelength
-                channel_intensity = self._render_channel(scene_sdf, camera_data, k)
+                channel_intensity, channel_amplitude = self._render_channel(scene_sdf, camera_data, k)
                 rgb_buffer[:, :, i] = channel_intensity
+                
+                # Сохраняем сырые амплитуды для нормализации
+                raw_amplitudes[color] = channel_amplitude
                 
         # Пост-обработка
         rgb_buffer = torch.clamp(rgb_buffer, 0.0, 1.0)
         gamma_corrected = torch.pow(rgb_buffer, 1.0/2.2)
-        return (gamma_corrected * 255.0).byte().cpu().numpy()
+        return (gamma_corrected * 255.0).byte().cpu().numpy(), raw_amplitudes
         
     def _render_monochrome(self, scene_sdf, camera_data):
         """Монохромный рендеринг"""
         k = 2.0 * math.pi / self.config.wavelengths['monochrome']
-        intensity = self._render_channel(scene_sdf, camera_data, k)
+        intensity, amplitude = self._render_channel(scene_sdf, camera_data, k)
         
         intensity = torch.clamp(intensity, 0.0, 1.0)
         gamma_corrected = torch.pow(intensity, 1.0/2.2)
-        return (gamma_corrected * 255.0).byte().cpu().numpy()
+        
+        # Для монохромного режима возвращаем амплитуду в формате совместимом с RGB
+        raw_amplitudes = {'monochrome': amplitude}
+        
+        return (gamma_corrected * 255.0).byte().cpu().numpy(), raw_amplitudes
         
     def _render_channel(self, scene_sdf, camera_data, k_value):
         """Рендеринг одного спектрального канала"""
         # Получаем направления лучей
         ray_dirs = self._compute_ray_directions(camera_data)
         
-        # Инициализация буфера интенсивности
+        # Инициализация буферов
         intensity_buffer = torch.zeros(self.config.height, self.config.width, device=self.device)
+        amplitude_buffer = torch.zeros(self.config.height, self.config.width, device=self.device, dtype=torch.complex64)
         
         # Батчевый рендеринг для оптимизации памяти
         batch_size = min(8, self.config.spp)
@@ -208,10 +379,14 @@ class GPUMPSBackend(RenderingBackendInterface):
             path_positions = self._generate_paths(ray_dirs, camera_data['position'], current_batch_size)
             
             # Трассировка путей
-            batch_intensities = self._trace_paths(path_positions, scene_sdf, k_value)
+            batch_intensities, batch_amplitudes = self._trace_paths(path_positions, scene_sdf, k_value)
             intensity_buffer += batch_intensities.sum(dim=0)
+            amplitude_buffer += batch_amplitudes.sum(dim=0)
             
-        return intensity_buffer / self.config.spp
+        final_intensity = intensity_buffer / self.config.spp
+        final_amplitude = amplitude_buffer / self.config.spp
+        
+        return final_intensity, final_amplitude
         
     def _compute_ray_directions(self, camera_data):
         """Вычисление направлений лучей для всех пикселей"""
@@ -268,9 +443,10 @@ class GPUMPSBackend(RenderingBackendInterface):
         return base_positions + path_offsets
         
     def _trace_paths(self, path_positions, scene_sdf, k_value):
-        """Трассировка путей и вычисление интенсивности"""
+        """Трассировка путей и вычисление интенсивности с амплитудами"""
         batch_size = path_positions.shape[0]
         batch_intensities = torch.zeros(batch_size, self.config.height, self.config.width, device=self.device)
+        batch_amplitudes = torch.zeros(batch_size, self.config.height, self.config.width, device=self.device, dtype=torch.complex64)
         
         for i in range(batch_size):
             positions = path_positions[i]
@@ -293,7 +469,7 @@ class GPUMPSBackend(RenderingBackendInterface):
                     segment_length = torch.norm(pos - prev_pos, dim=-1)
                     optical_lengths += segment_length
                     
-            # Вычисление интенсивности
+            # Вычисление квантовой амплитуды
             hit_mask = min_distances < self.config.hit_eps
             phases = k_value * optical_lengths
             
@@ -301,19 +477,33 @@ class GPUMPSBackend(RenderingBackendInterface):
             wavelength = 2.0 * math.pi / k_value
             dispersion_factor = 1.0 + 0.3 * (0.55 / wavelength - 1.0)
             
-            # Затухание и интерференция
+            # Затухание
             attenuation = 1.0 / (1.0 + 0.05 * optical_lengths * dispersion_factor)
-            interference = 0.8 + 0.2 * torch.cos(phases)
             
-            intensity = torch.where(
+            # Комплексная амплитуда с учетом фазы
+            complex_amplitude = attenuation.unsqueeze(-1) * torch.stack([
+                torch.cos(phases), torch.sin(phases)
+            ], dim=-1)
+            
+            # Преобразуем в torch.complex64
+            complex_amplitude = torch.complex(complex_amplitude[..., 0], complex_amplitude[..., 1])
+            
+            # Фоновая составляющая для промахов
+            background_amplitude = torch.tensor(0.01, device=self.device, dtype=torch.complex64)
+            
+            amplitude = torch.where(
                 hit_mask,
-                attenuation * interference,
-                torch.tensor(0.01, device=self.device)
+                complex_amplitude,
+                background_amplitude
             )
             
-            batch_intensities[i] = intensity
+            # Интенсивность = |амплитуда|²
+            intensity = torch.abs(amplitude) ** 2
             
-        return batch_intensities
+            batch_intensities[i] = intensity
+            batch_amplitudes[i] = amplitude
+            
+        return batch_intensities, batch_amplitudes
         
     def normalize_vector(self, v):
         """Нормализация вектора на GPU"""
@@ -330,7 +520,7 @@ class CPUNumpyBackend(RenderingBackendInterface):
     def _setup_device(self):
         return "cpu"
         
-    def render_frame(self, scene_sdf, camera_data) -> Tuple[np.ndarray, float]:
+    def render_frame(self, scene_sdf, camera_data) -> Tuple[np.ndarray, float, Optional[Dict[str, torch.Tensor]]]:
         """Упрощенный CPU рендеринг"""
         start_time = time.time()
         
@@ -338,10 +528,13 @@ class CPUNumpyBackend(RenderingBackendInterface):
         img = np.random.rand(self.config.height, self.config.width) * 128
         img = img.astype(np.uint8)
         
+        # Заглушка для raw_amplitudes
+        raw_amplitudes = None
+        
         render_time = time.time() - start_time
         fps = 1.0 / render_time if render_time > 0 else 0
         
-        return img, fps
+        return img, fps, raw_amplitudes
         
     def normalize_vector(self, v):
         """Нормализация вектора на CPU"""
@@ -365,6 +558,17 @@ class PathIntegralEngine:
             'avg_fps': 0.0
         }
         
+        # Система нормализации частот фотонов
+        self.frequency_map = None
+        if self.config.enable_normalization:
+            self.frequency_map = PhotonFrequencyMap(
+                self.config.width, 
+                self.config.height, 
+                self.config.normalization_frames,
+                device=self.backend.device
+            )
+            print(f"🔬 Система нормализации включена ({self.config.normalization_frames} кадров)")
+        
     def _create_backend(self) -> RenderingBackendInterface:
         """Создание backend'а в зависимости от конфигурации"""
         if self.config.backend == RenderingBackend.GPU_MPS:
@@ -376,12 +580,34 @@ class PathIntegralEngine:
             return CPUNumpyBackend(self.config)
             
     def render(self, scene_sdf_func, camera_position, camera_target) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Основной метод рендеринга"""
+        """Основной метод рендеринга с поддержкой нормализации частот"""
         # Подготовка данных камеры
         camera_data = self._prepare_camera_data(camera_position, camera_target)
         
         # Рендеринг кадра
-        img_array, fps = self.backend.render_frame(scene_sdf_func, camera_data)
+        img_array, fps, raw_amplitudes = self.backend.render_frame(scene_sdf_func, camera_data)
+        
+        # Система нормализации частот фотонов
+        if self.frequency_map is not None:
+            # Накапливаем данные для нормализации
+            if raw_amplitudes and not self.frequency_map.is_normalized:
+                self.frequency_map.accumulate_frame(raw_amplitudes, self.config.wavelengths)
+            
+            # Применяем нормализацию если она готова
+            if self.frequency_map.is_normalized:
+                if isinstance(img_array, np.ndarray):
+                    img_tensor = torch.from_numpy(img_array)
+                else:
+                    img_tensor = img_array
+                
+                # Применяем интерференционную коррекцию
+                normalized_tensor = self.frequency_map.apply_normalization(img_tensor)
+                
+                # Смешиваем с исходным изображением по силе нормализации
+                blend_factor = self.config.normalization_strength
+                img_tensor = (1.0 - blend_factor) * img_tensor + blend_factor * normalized_tensor
+                
+                img_array = img_tensor.cpu().numpy() if isinstance(img_tensor, torch.Tensor) else img_tensor
         
         # Обновление статистики
         self._update_stats(fps)
@@ -390,13 +616,27 @@ class PathIntegralEngine:
         if self.config.adaptive_quality:
             self._adjust_quality(fps)
             
-        return img_array, {
+        info = {
             'fps': fps,
             'spp': self.config.spp,
             'backend': self.config.backend.value,
             'mode': self.config.rendering_mode.value,
             'stats': self.stats.copy()
         }
+        
+        # Добавляем информацию о нормализации
+        if self.frequency_map is not None:
+            info['normalization'] = {
+                'enabled': True,
+                'frames_accumulated': self.frequency_map.frame_count,
+                'total_frames': self.frequency_map.normalization_frames,
+                'is_ready': self.frequency_map.is_normalized,
+                'strength': self.config.normalization_strength
+            }
+        else:
+            info['normalization'] = {'enabled': False}
+            
+        return img_array, info
         
     def _prepare_camera_data(self, position, target):
         """Подготовка данных камеры"""
@@ -454,7 +694,7 @@ class PathIntegralEngine:
         
     def get_info(self) -> Dict[str, Any]:
         """Получение информации о движке"""
-        return {
+        info = {
             'version': '3.0',
             'backend': self.config.backend.value,
             'device': str(self.backend.device),
@@ -463,6 +703,83 @@ class PathIntegralEngine:
             'spp': self.config.spp,
             'stats': self.stats
         }
+        
+        # Добавляем информацию о нормализации
+        if self.frequency_map is not None:
+            info['normalization'] = {
+                'enabled': True,
+                'frames_accumulated': self.frequency_map.frame_count,
+                'total_frames': self.frequency_map.normalization_frames,
+                'is_ready': self.frequency_map.is_normalized,
+                'strength': self.config.normalization_strength
+            }
+        else:
+            info['normalization'] = {'enabled': False}
+            
+        return info
+    
+    def enable_normalization(self, frames: int = 100, strength: float = 1.0):
+        """Включение системы нормализации частот фотонов"""
+        self.config.enable_normalization = True
+        self.config.normalization_frames = frames
+        self.config.normalization_strength = max(0.0, min(1.0, strength))
+        
+        # Создаем новую карту если её нет или изменились параметры
+        if (self.frequency_map is None or 
+            self.frequency_map.normalization_frames != frames):
+            self.frequency_map = PhotonFrequencyMap(
+                self.config.width, 
+                self.config.height, 
+                frames,
+                device=self.backend.device
+            )
+        
+        print(f"✅ Нормализация включена: {frames} кадров, сила {strength:.1f}")
+    
+    def disable_normalization(self):
+        """Отключение системы нормализации"""
+        self.config.enable_normalization = False
+        self.frequency_map = None
+        print("❌ Нормализация отключена")
+    
+    def reset_normalization(self):
+        """Сброс накопленных данных нормализации"""
+        if self.frequency_map is not None:
+            self.frequency_map.reset()
+            print("🔄 Данные нормализации сброшены")
+    
+    def set_normalization_strength(self, strength: float):
+        """Установка силы применения нормализации (0.0-1.0)"""
+        self.config.normalization_strength = max(0.0, min(1.0, strength))
+        print(f"⚙️  Сила нормализации: {self.config.normalization_strength:.1f}")
+    
+    def get_interference_pattern(self, channel: str = 'combined') -> Optional[np.ndarray]:
+        """Получение интерференционной картины для визуализации"""
+        if self.frequency_map is not None and self.frequency_map.is_normalized:
+            pattern = self.frequency_map.get_interference_pattern(channel)
+            return pattern.cpu().numpy() if isinstance(pattern, torch.Tensor) else pattern
+        return None
+    
+    def export_normalization_data(self, filepath: str):
+        """Экспорт данных нормализации в файл"""
+        if self.frequency_map is not None and self.frequency_map.is_normalized:
+            data = {
+                'width': self.frequency_map.width,
+                'height': self.frequency_map.height,
+                'frames': self.frequency_map.normalization_frames,
+                'normalized_intensity': self.frequency_map.normalized_intensity.cpu().numpy(),
+                'rgb_interference': {
+                    channel: torch.abs(complex_map).cpu().numpy()
+                    for channel, complex_map in self.frequency_map.rgb_interference_maps.items()
+                }
+            }
+            
+            import pickle
+            with open(filepath, 'wb') as f:
+                pickle.dump(data, f)
+            print(f"💾 Данные нормализации сохранены: {filepath}")
+        else:
+            print("⚠️  Нет данных для экспорта")
 
 
 # Заводские функции для удобства

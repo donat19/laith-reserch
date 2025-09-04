@@ -8,7 +8,9 @@
 
 import sys
 import time
+import math
 import numpy as np
+import os
 from pathlib import Path
 
 # Добавляем текущую директорию в path для импорта движка
@@ -71,18 +73,26 @@ def demo_scene_sdf(points):
     return scene
 
 
-def save_image(img_array, filename, info):
+def save_image(img_array, filename, info, output_dir="renders"):
     """Сохранение изображения"""
+    # Создаем папку если она не существует
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Полный путь к файлу
+    full_path = os.path.join(output_dir, filename)
+    
     try:
         from PIL import Image
         
         if len(img_array.shape) == 3:  # RGB
-            img = Image.fromarray(img_array)
+            img_rgb = (img_array * 255).astype(np.uint8)
+            img = Image.fromarray(img_rgb)
         else:  # Grayscale
-            img = Image.fromarray(img_array, mode='L')
+            img_mono = (img_array * 255).astype(np.uint8)
+            img = Image.fromarray(img_mono)
             
-        img.save(filename)
-        print(f"✅ Изображение сохранено: {filename}")
+        img.save(full_path)
+        print(f"✅ Изображение сохранено: {full_path}")
         print(f"   Размер: {img_array.shape}")
         print(f"   FPS: {info['fps']:.2f}")
         print(f"   SPP: {info['spp']}")
@@ -93,9 +103,11 @@ def save_image(img_array, filename, info):
     except ImportError:
         print("⚠️  PIL не найден, изображение не сохранено")
         print(f"Массив изображения: {img_array.shape}, FPS: {info['fps']:.2f}")
+    except Exception as e:
+        print(f"❌ Ошибка сохранения: {e}")
 
 
-def demo_basic_usage():
+def demo_basic_usage(output_dir="renders"):
     """Базовая демонстрация использования движка"""
     print("🎬 Демонстрация базового использования")
     print("=" * 40)
@@ -119,11 +131,11 @@ def demo_basic_usage():
         render_time = time.time() - start_time
         
         filename = f"demo_basic_{view_name}.png"
-        save_image(img, filename, info)
+        save_image(img, filename, info, output_dir)
         print(f"   Время рендера: {render_time:.2f}с\n")
 
 
-def demo_quality_presets():
+def demo_quality_presets(output_dir="renders"):
     """Демонстрация различных предустановок качества"""
     print("🎯 Демонстрация предустановок качества")
     print("=" * 40)
@@ -149,13 +161,13 @@ def demo_quality_presets():
         render_time = time.time() - start_time
         
         filename = f"demo_quality_{name}.png"
-        save_image(img, filename, info)
+        save_image(img, filename, info, output_dir)
         print(f"   Время рендера: {render_time:.2f}с")
         print(f"   Разрешение: {config.width}x{config.height}")
         print(f"   SPP: {config.spp}\n")
 
 
-def demo_rendering_modes():
+def demo_rendering_modes(output_dir="renders"):
     """Демонстрация различных режимов рендеринга"""
     print("🌈 Демонстрация режимов рендеринга")
     print("=" * 40)
@@ -168,16 +180,16 @@ def demo_rendering_modes():
     print("🔴🟢🔵 RGB Спектральный режим...")
     engine.switch_rendering_mode(RenderingMode.RGB_SPECTRAL)
     img_rgb, info_rgb = engine.render(demo_scene_sdf, camera_pos, camera_target)
-    save_image(img_rgb, "demo_mode_rgb_spectral.png", info_rgb)
+    save_image(img_rgb, "demo_mode_rgb_spectral.png", info_rgb, output_dir)
     
     # Монохромный режим  
     print("⚫ Монохромный режим...")
     engine.switch_rendering_mode(RenderingMode.MONOCHROME)
     img_mono, info_mono = engine.render(demo_scene_sdf, camera_pos, camera_target)
-    save_image(img_mono, "demo_mode_monochrome.png", info_mono)
+    save_image(img_mono, "demo_mode_monochrome.png", info_mono, output_dir)
 
 
-def demo_custom_config():
+def demo_custom_config(output_dir="renders"):
     """Демонстрация пользовательской конфигурации"""
     print("⚙️  Демонстрация пользовательской конфигурации")
     print("=" * 40)
@@ -214,7 +226,7 @@ def demo_custom_config():
     img, info = engine.render(demo_scene_sdf, camera_pos, camera_target)
     render_time = time.time() - start_time
     
-    save_image(img, "demo_custom_config.png", info)
+    save_image(img, "demo_custom_config.png", info, output_dir)
     print(f"Время рендера: {render_time:.2f}с")
 
 
@@ -261,6 +273,203 @@ def demo_performance_comparison():
         print(f"{name:<10} {pixels:<10} {spp:<6} {time_val:<8.2f} {fps:<8.2f}")
 
 
+def demo_normalization_system(output_dir="renders"):
+    """Демонстрация системы нормализации частот фотонов"""
+    print("🔬 Демонстрация системы нормализации частот фотонов")
+    print("=" * 50)
+    
+    # Создаем движок с включенной нормализацией
+    engine = create_interactive_engine()
+    
+    # Включаем нормализацию на 20 кадров для быстрой демонстрации
+    engine.enable_normalization(frames=20, strength=0.8)
+    
+    camera_pos = [3.0, 2.0, -3.0]
+    camera_target = [0.0, 0.0, 0.0]
+    
+    print("📊 Фаза накопления данных (20 кадров)...")
+    
+    # Рендерим кадры для накопления данных нормализации
+    for frame_num in range(20):
+        print(f"   Кадр {frame_num + 1}/20", end='\r')
+        
+        # Небольшое изменение камеры для разнообразия
+        angle = frame_num * 0.1
+        cam_pos = [
+            3.0 * math.cos(angle),
+            2.0 + 0.5 * math.sin(angle * 2),
+            -3.0 * math.sin(angle)
+        ]
+        
+        img, info = engine.render(demo_scene_sdf, cam_pos, camera_target)
+        
+        # Проверяем готовность нормализации
+        if info.get('normalization', {}).get('is_ready', False):
+            print(f"\n✅ Карта интерференции готова на кадре {frame_num + 1}!")
+            break
+    
+    print("\n🎨 Рендеринг с применением нормализации...")
+    
+    # Тестируем разные уровни силы нормализации
+    strengths = [0.0, 0.5, 1.0]
+    
+    for strength in strengths:
+        engine.set_normalization_strength(strength)
+        
+        img, info = engine.render(demo_scene_sdf, camera_pos, camera_target)
+        
+        strength_name = f"strength_{strength:.1f}".replace(".", "_")
+        filename = f"demo_normalization_{strength_name}.png"
+        save_image(img, filename, info, output_dir)
+        
+        print(f"   Сила нормализации {strength:.1f}: {info['fps']:.2f} FPS")
+    
+    # Сохраняем карту интерференции для визуализации
+    print("🌈 Сохранение карт интерференции...")
+    
+    interference_combined = engine.get_interference_pattern('combined')
+    if interference_combined is not None:
+        # Нормализуем для сохранения как изображение
+        interference_normalized = (interference_combined * 255).astype(np.uint8)
+        
+        try:
+            from PIL import Image
+            img_interference = Image.fromarray(interference_normalized)
+            interference_path = os.path.join(output_dir, "interference_pattern_combined.png")
+            img_interference.save(interference_path)
+            print(f"✅ Карта интерференции сохранена: {interference_path}")
+        except Exception as e:
+            print(f"⚠️  Ошибка сохранения карты интерференции: {e}")
+    
+    # Сохраняем RGB карты интерференции
+    for channel in ['red', 'green', 'blue']:
+        pattern = engine.get_interference_pattern(channel)
+        if pattern is not None:
+            pattern_normalized = (pattern * 255).astype(np.uint8)
+            try:
+                from PIL import Image
+                img_channel = Image.fromarray(pattern_normalized)
+                channel_path = os.path.join(output_dir, f"interference_pattern_{channel}.png")
+                img_channel.save(channel_path)
+                print(f"✅ Карта {channel} сохранена: {channel_path}")
+            except Exception as e:
+                print(f"⚠️  Ошибка сохранения карты {channel}: {e}")
+    
+    # Экспорт данных нормализации
+    normalization_data_path = os.path.join(output_dir, "normalization_data.pkl")
+    engine.export_normalization_data(normalization_data_path)
+    
+    print("\n📊 Информация о нормализации:")
+    norm_info = engine.get_info().get('normalization', {})
+    print(f"   Кадров накоплено: {norm_info.get('frames_accumulated', 0)}")
+    print(f"   Всего кадров: {norm_info.get('total_frames', 0)}")
+    print(f"   Готовность: {'Да' if norm_info.get('is_ready', False) else 'Нет'}")
+    print(f"   Сила применения: {norm_info.get('strength', 0.0):.1f}")
+
+
+def show_menu():
+    """Показать интерактивное меню выбора"""
+    print("\n" + "="*60)
+    print("🎬 Path Integral Engine v3.0 - Демонстрационное меню")
+    print("="*60)
+    print("Выберите тип рендеринга:")
+    print()
+    print("1. 📷 Базовое использование (3 вида камеры) ~4сек")
+    print("2. 🎯 Сравнение качества (Preview/Interactive/Production) ~60сек")
+    print("3. 🌈 Режимы рендеринга (RGB/Монохром) ~2сек")
+    print("4. ⚙️  Пользовательская конфигурация (высокое качество) ~15сек")
+    print("5. 📊 Тест производительности (без сохранения изображений) ~180сек")
+    print("6. � Система нормализации частот фотонов (НОВОЕ!) ~30сек")
+    print("7. �🚀 Полная демонстрация (все вышеперечисленное) ~290сек")
+    print("0. ❌ Выход")
+    print()
+    print("💡 Примерное время указано для Apple Silicon M1/M2/M3")
+    print("🔬 Вариант 6 - демонстрация интерференции фотонов за 100 кадров")
+    print()
+    
+    while True:
+        try:
+            choice = input("Ваш выбор (0-7): ").strip()
+            if choice in ['0', '1', '2', '3', '4', '5', '6', '7']:
+                return choice
+            else:
+                print("⚠️  Неверный выбор. Введите число от 0 до 7.")
+        except KeyboardInterrupt:
+            print("\n👋 Выход из программы...")
+            return '0'
+        except EOFError:
+            return '0'
+
+
+def get_output_directory():
+    """Получить папку для сохранения или создать по умолчанию"""
+    print("\n📁 Настройка папки для сохранения изображений:")
+    print("1. Использовать папку по умолчанию: './renders'")
+    print("2. Указать свою папку")
+    
+    while True:
+        try:
+            choice = input("Ваш выбор (1-2): ").strip()
+            
+            if choice == '1':
+                output_dir = "renders"
+                break
+            elif choice == '2':
+                custom_dir = input("Введите путь к папке: ").strip()
+                if custom_dir:
+                    output_dir = custom_dir
+                    break
+                else:
+                    print("⚠️  Пустой путь. Используется папка по умолчанию.")
+                    output_dir = "renders"
+                    break
+            else:
+                print("⚠️  Неверный выбор. Введите 1 или 2.")
+        except (KeyboardInterrupt, EOFError):
+            print("\nИспользуется папка по умолчанию: './renders'")
+            output_dir = "renders"
+            break
+    
+    # Создаем папку если не существует
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"✅ Папка готова: {os.path.abspath(output_dir)}")
+    except Exception as e:
+        print(f"⚠️  Не удалось создать папку {output_dir}: {e}")
+        print("Используется папка по умолчанию: './renders'")
+        output_dir = "renders"
+        os.makedirs(output_dir, exist_ok=True)
+    
+    return output_dir
+
+
+def run_selected_demo(choice, output_dir):
+    """Запустить выбранную демонстрацию"""
+    if choice == '1':
+        demo_basic_usage(output_dir)
+    elif choice == '2':
+        demo_quality_presets(output_dir)
+    elif choice == '3':
+        demo_rendering_modes(output_dir)
+    elif choice == '4':
+        demo_custom_config(output_dir)
+    elif choice == '5':
+        demo_performance_comparison()
+    elif choice == '6':
+        demo_normalization_system(output_dir)
+    elif choice == '7':
+        # Полная демонстрация
+        demo_basic_usage(output_dir)
+        demo_quality_presets(output_dir)
+        demo_rendering_modes(output_dir)
+        demo_custom_config(output_dir)
+        demo_performance_comparison()
+        demo_normalization_system(output_dir)
+        
+        print("\n🎉 Полная демонстрация завершена!")
+        print(f"📁 Все изображения сохранены в: {os.path.abspath(output_dir)}")
+
+
 def main():
     """Главная функция демонстрации"""
     print("🚀 Path Integral Engine v3.0 - Демонстрация")
@@ -276,22 +485,45 @@ def main():
     else:
         print("⚠️  MPS недоступен, используется CPU")
     
-    print()
-    
     try:
-        # Запуск всех демонстраций
-        demo_basic_usage()
-        demo_quality_presets()
-        demo_rendering_modes()
-        demo_custom_config()
-        demo_performance_comparison()
+        # Показываем меню и получаем выбор пользователя
+        choice = show_menu()
         
-        print("🎉 Все демонстрации завершены!")
-        print("📁 Проверьте сгенерированные изображения:")
-        print("   - demo_basic_*.png")
-        print("   - demo_quality_*.png") 
-        print("   - demo_mode_*.png")
-        print("   - demo_custom_config.png")
+        if choice == '0':
+            print("👋 До свидания!")
+            return
+        
+        # Получаем папку для сохранения
+        output_dir = get_output_directory()
+        
+        print(f"\n🎬 Запуск демонстрации...")
+        print(f"📁 Результаты будут сохранены в: {os.path.abspath(output_dir)}")
+        print()
+        
+        # Запускаем выбранную демонстрацию
+        start_time = time.time()
+        run_selected_demo(choice, output_dir)
+        total_time = time.time() - start_time
+        
+        print(f"\n⏱️  Общее время выполнения: {total_time:.2f} секунд")
+        print(f"📁 Проверьте сгенерированные изображения в папке: {os.path.abspath(output_dir)}")
+        
+        # Спрашиваем о повторном запуске
+        print("\n" + "="*50)
+        while True:
+            try:
+                repeat = input("🔄 Запустить ещё одну демонстрацию? (y/n): ").strip().lower()
+                if repeat in ['y', 'yes', 'д', 'да']:
+                    main()  # Рекурсивный вызов для повторного запуска
+                    break
+                elif repeat in ['n', 'no', 'н', 'нет']:
+                    print("👋 До свидания!")
+                    break
+                else:
+                    print("⚠️  Введите 'y' для да или 'n' для нет")
+            except (KeyboardInterrupt, EOFError):
+                print("\n👋 До свидания!")
+                break
         
     except Exception as e:
         print(f"❌ Ошибка во время демонстрации: {e}")
